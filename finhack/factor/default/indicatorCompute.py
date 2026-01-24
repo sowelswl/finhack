@@ -18,8 +18,9 @@ from finhack.library.mydb import mydb
 from finhack.library.config import Config
 from finhack.market.astock.astock import AStock
 from filelock import FileLock 
+import psutil  # 添加psutil库用于监控内存
 
-from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, ALL_COMPLETED, as_completed
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 import finhack.library.log as Log
  
@@ -65,9 +66,32 @@ class indicatorCompute():
                     except Exception as e:
                         Log.logger.error(f"删除因子文件 {factor} 时出错: {str(e)}")
         
-        n = 30
-        if cpu_count() > 2:
-            n = cpu_count() - 2
+        # 动态调整进程数量
+        def get_optimal_workers():
+            """根据当前内存使用情况确定最优工作进程数"""
+            available_memory = psutil.virtual_memory().available
+            total_memory = psutil.virtual_memory().total
+            
+            # 保留至少1GB内存或总内存的10%（取较大值）
+            min_memory_reserve = max(1 * 1024 * 1024 * 1024, total_memory * 0.1)
+            
+            # 可用于计算的内存
+            usable_memory = available_memory - min_memory_reserve
+            
+            # 估计每个进程使用的内存（初始估计为500MB）
+            memory_per_process = 500 * 1024 * 1024
+            
+            # 计算可以支持的最大进程数
+            max_processes = max(1, int(usable_memory / memory_per_process))
+            
+            # 不超过CPU核心数-2（至少保留1个）
+            cpu_limit = max(1, cpu_count() - 2)
+            
+            return min(max_processes, cpu_limit)
+        
+        # 初始进程数为1
+        current_workers = 1
+        max_workers = cpu_count() - 2 if cpu_count() > 2 else 1
         
         tasklist = []
         code_list = code_list['ts_code'].to_list()
@@ -87,17 +111,80 @@ class indicatorCompute():
         for factor in factor_list:
             single_factors_path1 = CACHE_DIR + "/single_factors_tmp1/" + factor + '.csv'
             lock_registry[factor] = FileLock(single_factors_path1 + ".lock")
-        code_lists = split_list_n_list(code_list, n)
-        for code_list in code_lists:
-            with ProcessPoolExecutor(max_workers=n) as pool:
-                for ts_code in code_list:
+        
+        # 记录初始内存使用情况
+        initial_memory = psutil.virtual_memory().available
+        memory_usage_history = []
+        
+        code_lists = list(split_list_n_list(code_list, max_workers))
+        
+        # 动态调整进程池处理任务
+        for batch_idx, batch_codes in enumerate(code_lists):
+            Log.logger.info(f"处理第 {batch_idx+1}/{len(code_lists)} 批股票代码，共 {len(batch_codes)} 个")
+            
+            # 根据当前内存使用情况调整工作进程数
+            if batch_idx > 0:  # 第一批使用初始进程数
+                # 计算每个进程的平均内存使用量
+                if memory_usage_history:
+                    avg_memory_per_process = sum(memory_usage_history) / len(memory_usage_history) / current_workers
+                    
+                    # 更新内存使用估计
+                    current_memory = psutil.virtual_memory().available
+                    memory_used = initial_memory - current_memory
+                    
+                    # 记录内存使用情况
+                    memory_usage_history.append(memory_used)
+                    
+                    # 如果平均每个进程内存使用量较低，可以增加进程数
+                    if current_memory > 2 * 1024 * 1024 * 1024 and current_workers < max_workers:  # 有2GB以上可用内存
+                        new_workers = min(current_workers + 1, max_workers)
+                        Log.logger.info(f"内存充足，增加进程数: {current_workers} -> {new_workers}")
+                        current_workers = new_workers
+                    
+                    # 如果可用内存不足1GB，减少进程数
+                    elif current_memory < 1 * 1024 * 1024 * 1024 and current_workers > 1:
+                        new_workers = max(1, current_workers - 1)
+                        Log.logger.info(f"内存不足，减少进程数: {current_workers} -> {new_workers}")
+                        current_workers = new_workers
+                else:
+                    # 第一次调整，使用启发式方法
+                    optimal_workers = get_optimal_workers()
+                    if optimal_workers > current_workers:
+                        Log.logger.info(f"初始内存充足，增加进程数: {current_workers} -> {optimal_workers}")
+                        current_workers = optimal_workers
+            
+            Log.logger.info(f"当前使用 {current_workers} 个工作进程")
+            
+            # 使用当前进程数处理这一批代码
+            with ProcessPoolExecutor(max_workers=current_workers) as pool:
+                batch_tasks = []
+                for ts_code in batch_codes:
+                    # 创建一个简单的参数字典，避免传递不可序列化的对象
+                    # 将lock_registry替换为简单的锁文件路径字典
+                    lock_paths = {}
+                    for factor in factor_list:
+                        single_factors_path1 = CACHE_DIR + "/single_factors_tmp1/" + factor + '.csv'
+                        lock_paths[factor] = single_factors_path1 + ".lock"
+
                     mytask = pool.submit(
                         indicatorCompute.computeListByStock,
                         ts_code, list_name, '', factor_list, c_list, True, False, True,
-                        pd.DataFrame(), db, min_lastdate, lock_registry, force_factors
+                        pd.DataFrame(), db, min_lastdate, lock_paths, force_factors
                     )
-                    tasklist.append(mytask)
-        
+                    batch_tasks.append(mytask)
+                
+                # 等待当前批次的任务完成
+                for future in as_completed(batch_tasks):
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        Log.logger.error(f"任务执行出错: {str(e)}")
+                        Log.logger.error(f"错误详情: {traceback.format_exc()}")
+                
+                tasklist.extend(batch_tasks)
+            
+            # 每批次处理完后，强制进行垃圾回收
+            gc.collect()
         # 等待所有任务完成
         wait(tasklist, return_when=ALL_COMPLETED)
         Log.logger.info(list_name + ' computed')
@@ -105,9 +192,6 @@ class indicatorCompute():
         # 移动计算好的因子文件
         os.system('mv ' + CACHE_DIR + '/single_factors_tmp1/* ' + CACHE_DIR + '/single_factors_tmp2/')
         os.system('mv ' + CACHE_DIR + '/single_factors_tmp2/* ' + SINGLE_FACTORS_DIR)
-                
-
-        
             
         #计算单支股票的一坨因子
         #pure=True时，只保留factor_list中的因子
@@ -267,8 +351,15 @@ class indicatorCompute():
                                 
                                 # 使用文件锁防止并发写入冲突
                                 if lock_registry and factor_name in lock_registry:
-                                    with lock_registry[factor_name]:
-                                        df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
+                                    lock_path = lock_registry[factor_name]
+                                    # 检查lock_path是否为字符串，如果是则创建FileLock对象
+                                    if isinstance(lock_path, str):
+                                        with FileLock(lock_path):
+                                            df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
+                                    else:
+                                        # 假设lock_path已经是FileLock对象
+                                        with lock_path:
+                                            df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
                                 else:
                                     df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
                                     
@@ -369,8 +460,15 @@ class indicatorCompute():
                             
                             # 使用文件锁防止并发写入冲突
                             if lock_registry and factor_name in lock_registry:
-                                with lock_registry[factor_name]:
-                                    df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
+                                lock_path = lock_registry[factor_name]
+                                # 检查lock_path是否为字符串，如果是则创建FileLock对象
+                                if isinstance(lock_path, str):
+                                    with FileLock(lock_path):
+                                        df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
+                                else:
+                                    # 假设lock_path已经是FileLock对象
+                                    with lock_path:
+                                        df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
                             else:
                                 df.to_csv(single_factors_path1, mode='a', encoding='utf-8', header=False, index=False)
                             

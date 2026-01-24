@@ -8,9 +8,10 @@ from finhack.factor.default.preCheck import preCheck
 from finhack.factor.default.indicatorCompute import indicatorCompute
 from finhack.factor.default.alphaEngine import alphaEngine
 from finhack.market.astock.astock import AStock
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, ALL_COMPLETED, as_completed
 from finhack.factor.default.factorPkl import factorPkl
 import finhack.library.log as Log
+import psutil  # 添加psutil库用于监控内存
 
 class taskRunner:
     @staticmethod
@@ -97,26 +98,84 @@ class taskRunner:
                     i = 0
                     tasks = []
                     
-                    with ProcessPoolExecutor(max_workers=8) as pool:
-                        for factor in factor_list:   
-                            i = i + 1
-                            alpha_name = factor_list_name + '_' + str(i).zfill(3)
+                    # 动态调整进程数量
+                    initial_workers = 1  # 初始进程数为1
+                    max_workers = os.cpu_count() - 2 if os.cpu_count() > 2 else 1  # 最大进程数
+                    current_workers = initial_workers
+                    
+                    # 记录初始内存使用情况
+                    initial_memory = psutil.virtual_memory().available
+                    memory_usage_history = []
+                    
+                    # 将因子列表分批处理
+                    batch_size = 10  # 每批处理的因子数量
+                    factor_batches = [factor_list[i:i+batch_size] for i in range(0, len(factor_list), batch_size)]
+                    
+                    Log.logger.info(f"Alpha因子计算开始，共 {len(factor_list)} 个因子，分为 {len(factor_batches)} 批处理")
+                    
+                    for batch_idx, batch_factors in enumerate(factor_batches):
+                        Log.logger.info(f"处理第 {batch_idx+1}/{len(factor_batches)} 批Alpha因子，共 {len(batch_factors)} 个")
+                        
+                        # 根据当前内存使用情况调整工作进程数
+                        if batch_idx > 0:  # 第一批使用初始进程数
+                            time.sleep(5)  # 等待5秒，让内存使用情况稳定
+                            # 计算每个进程的平均内存使用量
+                            if memory_usage_history:
+                                current_memory = psutil.virtual_memory().available
+                                memory_used = initial_memory - current_memory
+                                
+                                # 记录内存使用情况
+                                memory_usage_history.append(memory_used)
+                                
+                                # 如果平均每个进程内存使用量较低，可以增加进程数
+                                if current_memory > 2 * 1024 * 1024 * 1024 and current_workers < max_workers:  # 有2GB以上可用内存
+                                    new_workers = min(current_workers + 1, max_workers)
+                                    Log.logger.info(f"内存充足，增加进程数: {current_workers} -> {new_workers}")
+                                    current_workers = new_workers
+                                
+                                # 如果可用内存不足1GB，减少进程数
+                                elif current_memory < 1 * 1024 * 1024 * 1024 and current_workers > 1:
+                                    new_workers = max(1, current_workers - 1)
+                                    Log.logger.info(f"内存不足，减少进程数: {current_workers} -> {new_workers}")
+                                    current_workers = new_workers
+                        
+                        Log.logger.info(f"当前使用 {current_workers} 个工作进程")
+                        
+                        batch_tasks = []
+                        with ProcessPoolExecutor(max_workers=current_workers) as pool:
+                            for factor in batch_factors:   
+                                i = i + 1
+                                alpha_name = factor_list_name + '_' + str(i).zfill(3)
+                                
+                                # 检查是否需要强制重新计算
+                                force_recalc = alpha_name in force_factors
+                                
+                                mytask = pool.submit(
+                                    alphaEngine.calc,
+                                    factor,
+                                    pd.DataFrame(),
+                                    alpha_name,
+                                    False,  # check
+                                    True,   # save
+                                    False,  # ignore_notice
+                                    [],     # stock_list
+                                    not force_recalc  # diff - 如果强制重新计算，则不做差异检查
+                                )
+                                batch_tasks.append(mytask)
                             
-                            # 检查是否需要强制重新计算
-                            force_recalc = alpha_name in force_factors
+                            # 等待当前批次的任务完成
+                            for future in as_completed(batch_tasks):
+                                try:
+                                    result = future.result()
+                                except Exception as e:
+                                    Log.logger.error(f"Alpha因子计算出错: {str(e)}")
                             
-                            mytask = pool.submit(
-                                alphaEngine.calc,
-                                factor,
-                                pd.DataFrame(),
-                                alpha_name,
-                                False,  # check
-                                True,   # save
-                                False,  # ignore_notice
-                                [],     # stock_list
-                                not force_recalc  # diff - 如果强制重新计算，则不做差异检查
-                            )
-                            tasks.append(mytask)
+                            tasks.extend(batch_tasks)
+                        
+                        # 每批次处理完后，强制进行垃圾回收
+                        import gc
+                        gc.collect()
+                        time.sleep(2)  # 等待5秒，让内存使用情况稳定
                     
                     # 等待所有alpha因子计算完成
                     wait(tasks, return_when=ALL_COMPLETED)

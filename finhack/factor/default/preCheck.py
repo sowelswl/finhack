@@ -6,8 +6,10 @@ import hashlib
 import pandas as pd
 import os
 import re
+import gc
 import datetime
 import warnings
+import psutil 
 import numpy as np
 from functools import lru_cache
 from importlib import import_module
@@ -16,7 +18,7 @@ import finhack.library.log as Log
 from finhack.factor.default.factorManager import factorManager
 from finhack.factor.default.alphaEngine import alphaEngine
 from finhack.factor.default.indicatorCompute import indicatorCompute
-from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, ALL_COMPLETED, as_completed  # 添加as_completed导入
 from runtime.constant import *
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
@@ -293,9 +295,7 @@ class preCheck():
         
  
 
-    
-    
-    #检测某个alpha是否有效
+   #检测某个alpha是否有效
     def checkAlpha(listname,alphaname,alpha):
         try:
             #
@@ -394,29 +394,100 @@ class preCheck():
         except Exception as e:
             print("precheck %s error: %s",(alpha,str(e)))
  
-
+    
+ 
+    def checkAlphas():
+        print('checkAlphas')
+        alphalists = factorManager.getAlphaLists()
+        
+        # 初始进程数为1
+        initial_workers = 1
+        max_workers = os.cpu_count() - 2 if os.cpu_count() > 2 else 1  # 最大进程数
+        current_workers = initial_workers
+        
+        # 记录初始内存使用情况
+        initial_memory = psutil.virtual_memory().available
+        memory_usage_history = []
+        
+        for listname in alphalists:
+            alphas = factorManager.getAlphaList(listname)
+            i = 0
+            
+            # 将alpha列表分批处理
+            batch_size = 10  # 每批处理的alpha数量
+            alpha_batches = [alphas[i:i+batch_size] for i in range(0, len(alphas), batch_size)]
+            
+            Log.logger.info(f"Alpha检查开始，共 {len(alphas)} 个alpha，分为 {len(alpha_batches)} 批处理")
+            
+            for batch_idx, batch_alphas in enumerate(alpha_batches):
+                Log.logger.info(f"处理第 {batch_idx+1}/{len(alpha_batches)} 批Alpha，共 {len(batch_alphas)} 个")
+                
+                # 根据当前内存使用情况调整工作进程数
+                if batch_idx > 0:  # 第一批使用初始进程数
+                    # 计算内存使用情况
+                    time.sleep(5) 
+                    current_memory = psutil.virtual_memory().available
+                    memory_used = initial_memory - current_memory
+                    
+                    # 记录内存使用情况
+                    memory_usage_history.append(memory_used)
+                    
+                    # 如果平均每个进程内存使用量较低，可以增加进程数
+                    if current_memory > 2 * 1024 * 1024 * 1024 and current_workers < max_workers:  # 有2GB以上可用内存
+                        new_workers = min(current_workers + 1, max_workers)
+                        Log.logger.info(f"内存充足，增加进程数: {current_workers} -> {new_workers}")
+                        current_workers = new_workers
+                    
+                    # 如果可用内存不足1GB，减少进程数
+                    elif current_memory < 1 * 1024 * 1024 * 1024 and current_workers > 1:
+                        new_workers = max(1, current_workers - 1)
+                        Log.logger.info(f"内存不足，减少进程数: {current_workers} -> {new_workers}")
+                        current_workers = new_workers
+                
+                Log.logger.info(f"当前使用 {current_workers} 个工作进程")
+                
+                tasklist = []
+                with ProcessPoolExecutor(max_workers=current_workers) as pool:
+                    for alpha in batch_alphas:
+                        i = i + 1
+                        alphaname = listname + '_' + str(i).zfill(3)
+                        task = pool.submit(preCheck.checkAlpha, listname, alphaname, alpha)
+                        tasklist.append(task)
+                    
+                    # 等待当前批次的任务完成
+                    for future in as_completed(tasklist):
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            Log.logger.error(f"Alpha检查出错: {str(e)}")
+                
+                # 每批次处理完后，强制进行垃圾回收
+                gc.collect()
+                time.sleep(2)
+            
+            print('---------------')
             
                 
                 
                 
                 
-    def checkAlphas():
-        print('checkAlphas')
-        alphalists=factorManager.getAlphaLists()
-        for listname in alphalists:
-            alphas=factorManager.getAlphaList(listname)
-            i=0
-            tasklist=[]
-            with ProcessPoolExecutor(max_workers=24) as pool:
-                for alpha in alphas:
-                    i=i+1
-                    alphaname=listname+'_'+str(i).zfill(3)
+    # def checkAlphas():
+    #     print('checkAlphas')
+    #     alphalists=factorManager.getAlphaLists()
+    #     for listname in alphalists:
+    #         alphas=factorManager.getAlphaList(listname)
+    #         i=0
+    #         tasklist=[]
+    #         with ProcessPoolExecutor(max_workers=24) as pool:
+    #             for alpha in alphas:
+    #                 i=i+1
+    #                 alphaname=listname+'_'+str(i).zfill(3)
                     
-                    #print(alphaname+":"+alpha)
-                    #preCheck.checkAlpha(listname=listname,alphaname=alphaname,alpha=alpha)
-                    task=pool.submit(preCheck.checkAlpha,listname,alphaname,alpha)
-                    tasklist.append(task)
-            wait(tasklist, return_when=ALL_COMPLETED)
-            print('---------------')
+    #                 #print(alphaname+":"+alpha)
+    #                 #preCheck.checkAlpha(listname=listname,alphaname=alphaname,alpha=alpha)
+    #                 task=pool.submit(preCheck.checkAlphas,listname,alphaname,alpha)
+    #                 tasklist.append(task)
+    #         wait(tasklist, return_when=ALL_COMPLETED)
+    #         print('---------------')
                 
  
