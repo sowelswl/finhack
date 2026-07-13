@@ -55,6 +55,9 @@ class tsCB:
                     mydb.safe_to_sql(df, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
                     break
                 except Exception as e:
+                    if "访问权限" in str(e) or "没有接口" in str(e):
+                        Log.logger.warning(api+":无接口权限(永久错误),跳过整个函数,不重试\n"+str(e))
+                        return
                     if "每天最多访问" in str(e) or "每小时最多访问" in str(e):
                         Log.logger.warning(api+":触发最多访问。\n"+str(e)) 
                         return
@@ -98,6 +101,9 @@ class tsCB:
                     mydb.safe_to_sql(df, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
                     break
                 except Exception as e:
+                    if "访问权限" in str(e) or "没有接口" in str(e):
+                        Log.logger.warning(api+":无接口权限(永久错误),跳过整个函数,不重试\n"+str(e))
+                        return
                     if "每天最多访问" in str(e) or "每小时最多访问" in str(e):
                         Log.logger.warning(api+":触发最多访问。\n"+str(e)) 
                         return

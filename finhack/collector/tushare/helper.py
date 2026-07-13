@@ -221,7 +221,7 @@ class tsSHelper:
                         return
                          
                    
-                    elif "您没有访问该接口的权限" in str(e):
+                    elif "访问权限" in str(e):
                         Log.logger.warning(api+":没有访问该接口的权限。\n"+str(e))
                         return
                     
@@ -265,7 +265,7 @@ class tsSHelper:
                         Log.logger.warning(api+":今日权限用完。\n"+str(e))
                         return
                    
-                    elif "您没有访问该接口的权限" in str(e):
+                    elif "访问权限" in str(e):
                         Log.logger.warning(api+":没有访问该接口的权限。\n"+str(e))
                         return
                     
